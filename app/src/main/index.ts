@@ -376,14 +376,19 @@ function isSameDocumentNavigation(url: string, currentUrl: string): boolean {
 function createWindow() {
   const isDev = process.argv.includes('--dev') || !!process.env.ELECTRON_RENDERER_URL;
   const shouldOpenDevTools = process.argv.includes('--devtools');
+  const isLinux = process.platform === 'linux';
 
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
     minWidth: 800,
     minHeight: 500,
-    titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 14, y: 10 },
+    ...(isLinux ? {
+      frame: false,
+    } : {
+      titleBarStyle: 'hiddenInset',
+      trafficLightPosition: { x: 14, y: 10 },
+    }),
     backgroundColor: '#0a0b14',
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
