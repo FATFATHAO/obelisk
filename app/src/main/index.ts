@@ -31,6 +31,7 @@ import type {
   SessionPatchSnapshot,
   SessionMetadata,
   SourceQueryOptions,
+  WindowControlAction,
 } from '../shared/ipc-types.ts';
 import type {
   SessionDetailAssemblyInput,
@@ -397,6 +398,10 @@ function createWindow() {
       devTools: isDev || shouldOpenDevTools,
     },
   });
+
+  const pushWindowState = () => win.webContents.send('obelisk:window-state', { maximized: win.isMaximized() });
+  win.on('maximize', pushWindowState);
+  win.on('unmaximize', pushWindowState);
 
   // Prevent Electron's built-in zoom so Cmd+=/- reaches the renderer
   win.webContents.on('before-input-event', (event, input) => {
@@ -914,6 +919,17 @@ ipcMain.handle('capture:copy', async (event, { cardIdx, archetype, filename } = 
   const image = await createExportCapture(win, query);
   clipboard.writeImage(image);
   return true;
+});
+
+ipcMain.handle('win:control', (event, action: WindowControlAction) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return null;
+  switch (action) {
+    case 'minimize': win.minimize(); return null;
+    case 'toggle-maximize': win.isMaximized() ? win.unmaximize() : win.maximize(); return null;
+    case 'close': win.close(); return null;
+    default: throw new Error(`win:control accepts 'minimize', 'toggle-maximize', or 'close'; received "${String(action)}"`);
+  }
 });
 
 // --- Recap files ---
