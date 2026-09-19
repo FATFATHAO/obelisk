@@ -81,6 +81,9 @@ input { font: inherit; color: inherit; }
   border-bottom: 1px solid var(--hairline);
   flex-shrink: 0; z-index: 100;
   display: flex; align-items: center; justify-content: center;
+  padding: 0 16px;
+}
+.titlebar.mac {
   padding: 0 16px 0 78px;
 }
 .titlebar-text {

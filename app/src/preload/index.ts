@@ -9,6 +9,7 @@ import type {
 } from '../shared/ipc-types.ts';
 
 contextBridge.exposeInMainWorld('obelisk', {
+  platform: process.platform,
   getSessions: (opts?: unknown) => ipcRenderer.invoke('db:getSessions', opts),
   getSessionMessages: (id: string) => ipcRenderer.invoke('db:getSessionMessages', id),
   getSessionToolCalls: (id: string) => ipcRenderer.invoke('db:getSessionToolCalls', id),

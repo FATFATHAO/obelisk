@@ -31,6 +31,9 @@ const routeSession = computed(() => {
   return getSessionSummary(route.params.id);
 });
 
+// --- Platform ---
+const platform = window.obelisk?.platform ?? null;
+
 // --- Sidebar data ---
 
 const activeCount = computed(() => state.memories.filter(m => !m.archived).length);
@@ -255,7 +258,7 @@ provide('recapGenerateOpen', recapGenerateOpen);
 <template>
   <router-view v-if="isExportRoute" />
   <div class="app" v-else>
-    <div class="titlebar">
+    <div class="titlebar" :class="{ mac: platform === 'darwin' }">
       <div class="titlebar-text" id="titlebar-text">
         <span class="app-name">{{ windowTitle.appName }}</span>
         <span class="sep">—</span>
