@@ -106,3 +106,81 @@ test('caller routes provider-declared exact files regardless of suffix', async (
     mock.reset();
   }
 });
+
+// Owner's third review: the hermes adapter's own watchTargets() has to put each profile store in
+// front of this caller as an exact file target. A `.db` file under the tree target is dropped by
+// the transcript filter below, so a profile write that is not declared exactly waits for the
+// periodic reconcile — this drives the real provider's list, not a hand-written stand-in.
+test('a hermes profile store is declared exactly and reaches the indexer', async () => {
+  let captured = null;
+  const ctx = mock.module(WATCHER_URL, {
+    namedExports: {
+      createAdaptiveWatcher: (opts) => {
+        captured = opts;
+        return { stop() {}, ready: Promise.resolve() };
+      },
+    },
+  });
+  try {
+    const { createHermesProvider } = await import('../packages/core/src/providers/hermes.ts');
+    const { createIndexerService } = await import(`../app/src/main/indexer-service.ts?watcher-hermes=${Date.now()}`);
+    const home = mkdtempSync(join(tmpdir(), 'obelisk-hermes-wf-'));
+    const profileStore = join(home, 'profiles', 'coder', 'state.db');
+    mkdirSync(join(home, 'profiles', 'coder'), { recursive: true });
+    writeFileSync(profileStore, 'sqlite fixture');
+    writeFileSync(`${profileStore}-wal`, '');
+
+    const provider = createHermesProvider({
+      rootDir: home,
+      openStore: () => { throw new Error('the watcher filter must not open a store'); },
+    });
+    const targets = provider.watchTargets(home);
+    assert.ok(
+      targets.some((target) => target.kind === 'file' && target.path === profileStore),
+      'the real watchTargets() output names the profile store exactly',
+    );
+
+    const timers = manualTimers();
+    const builds = [];
+    const service = createIndexerService({
+      buildIndex: async (args) => builds.push(args),
+      watchTargets: targets,
+      writeHeartbeat: () => {},
+      timers,
+      stabilityMs: 0,
+    });
+    service.start({ buildOnStart: false });
+
+    // A declared exact file forwards on the event, suffix or not, and stays out of the hot
+    // overlay because the file poller already pins it.
+    captured.onInvalidate({ type: 'paths', paths: [`${profileStore}-wal`] });
+    timers.flush();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(
+      builds.at(-1).changedPaths,
+      [`${profileStore}-wal`],
+      'a profile store update reaches the indexer',
+    );
+    assert.equal(captured.shouldPromote(profileStore), false, 'a pinned exact file stays out of the hot overlay');
+
+    // Contrast: a profile that appeared after the target list was computed is only a `.db` file
+    // under the tree, and the caller still filters those (the suffix filter is not switched off).
+    const lateStore = join(home, 'profiles', 'late', 'state.db');
+    mkdirSync(join(home, 'profiles', 'late'), { recursive: true });
+    writeFileSync(lateStore, 'sqlite fixture');
+    captured.onInvalidate({ type: 'paths', paths: [lateStore] });
+    for (let i = 0; i < 8; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      timers.flush();
+    }
+    assert.equal(
+      builds.flatMap((build) => build.changedPaths ?? []).includes(lateStore),
+      false,
+      'an undeclared database file under the tree is still filtered out',
+    );
+    service.stop();
+  } finally {
+    ctx.restore();
+    mock.reset();
+  }
+});
