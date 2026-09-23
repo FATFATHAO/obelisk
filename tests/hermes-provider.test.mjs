@@ -449,10 +449,10 @@ test('an index written under the previous canonical marker is replayed after the
     const writeMarker = db.prepare(
       'INSERT INTO index_state (jsonl_path, mtime, lines_processed, cursor) VALUES (?, 0, 0, ?)',
     );
-    writeMarker.run('__hermes_canonical_transcript_v4__', '0:0:hermes-snapshot-v2:stale');
+    writeMarker.run('__hermes_canonical_transcript_v5__', '0:0:hermes-snapshot-v2:stale');
 
     const stale = createProviderIndexPlan(db, registry);
-    assert.equal(stale.pendingMarkers.get('hermes'), '__hermes_canonical_transcript_v5__');
+    assert.equal(stale.pendingMarkers.get('hermes'), '__hermes_canonical_transcript_v6__');
     assert.deepEqual(stale.replayKeys.get('hermes'), [unit.key], 'the previously indexed unit replays');
     assert.equal(
       stale.items.find(item => item.unit.key === unit.key).cursor,
@@ -461,7 +461,7 @@ test('an index written under the previous canonical marker is replayed after the
     );
 
     // Once the current marker is present the index has converged: no marker, no replay.
-    writeMarker.run('__hermes_canonical_transcript_v5__', '0:0:hermes-snapshot-v2:current');
+    writeMarker.run('__hermes_canonical_transcript_v6__', '0:0:hermes-snapshot-v2:current');
     const settled = createProviderIndexPlan(db, registry);
     assert.equal(settled.pendingMarkers.get('hermes'), undefined);
     assert.equal(settled.replayKeys.get('hermes'), undefined);
@@ -659,6 +659,38 @@ test('raw() returns the exact Hermes row as evidence, and null when it cannot be
   }
 });
 
+test('a long Hermes message remains available through raw() windows and full-text expansion', () => {
+  const layout = fixtureHome();
+  const longText = `${'complete response '.repeat(800)}END`;
+  writeStore(layout.primaryPath, db => {
+    db.prepare('UPDATE messages SET content = ? WHERE id = ?').run(longText, layout.ids.assistant);
+  });
+  const provider = createHermesProvider({ rootDir: layout.base, openStore });
+  const index = indexFixture(provider);
+  try {
+    settle(index);
+    const sessionId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
+    const uuid = `${sessionId}:message:${layout.ids.assistant}`;
+    const raw = provider.raw({
+      source: 'hermes', messageUuid: uuid,
+      session: { jsonl_path: `${layout.primaryPath}#session:${SESSION_ALPHA}` }, agentId: null,
+    });
+    assert.equal(raw.messageText, longText, 'the App receives the full source message');
+    assert.ok(raw.text.length > 10000);
+    assert.equal(raw.totalLength, raw.text.length);
+
+    const api = createQueryApi(index.db, { providerRegistry: createProviderRegistry([provider]) });
+    const first = api.raw(uuid, { offset: 0, limit: 10000 });
+    const second = api.raw(uuid, { offset: 10000, limit: 10000 });
+    assert.equal(first.text + second.text, raw.text, 'CLI windows reach the entire raw row');
+    assert.equal(first.hasMore, true);
+    assert.equal(second.hasMore, false);
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
 test('persist() writes a Hermes session and a changed store replays it instead of duplicating rows', () => {
   const layout = fixtureHome();
   const db = new DatabaseSync(':memory:');
@@ -733,7 +765,7 @@ test('persist() writes a Hermes session and a changed store replays it instead o
 // Owner's third review: a write to `profiles/<name>/state.db` is a `.db` file under the tree
 // target, and the caller's transcript filter drops those, so the store only became a hint at the
 // next full reconcile. Each existing profile store is now named exactly, like the default store.
-test('watchTargets() names the default store and every profile store exactly, plus the tree', () => {
+test('watchTargets() names the default store and declares profile database files on the tree', () => {
   const layout = fixtureHome({ wal: true });
   const profilesDir = join(layout.base, 'profiles');
   try {
@@ -741,16 +773,12 @@ test('watchTargets() names the default store and every profile store exactly, pl
     assert.deepEqual(provider.watchTargets(layout.base), [
       { kind: 'file', path: join(layout.base, 'state.db') },
       { kind: 'file', path: join(layout.base, 'state.db-wal') },
-      { kind: 'tree', path: profilesDir },
-      { kind: 'file', path: join(profilesDir, 'coder', 'state.db') },
-      { kind: 'file', path: join(profilesDir, 'coder', 'state.db-wal') },
+      { kind: 'tree', path: profilesDir, fileNames: ['state.db', 'state.db-wal'] },
     ]);
     assert.deepEqual(provider.watchTargets('').map(target => target.path), [
       join(layout.base, 'state.db'),
       join(layout.base, 'state.db-wal'),
       profilesDir,
-      join(profilesDir, 'coder', 'state.db'),
-      join(profilesDir, 'coder', 'state.db-wal'),
     ], 'an empty configured root falls back to the descriptor default');
     assert.equal(provider.descriptor.requiresExplicitRoot, undefined);
   } finally {
@@ -758,7 +786,7 @@ test('watchTargets() names the default store and every profile store exactly, pl
   }
 });
 
-test('watchTargets() sorts profile targets, never names a sidecar, and survives a home with none', () => {
+test('watchTargets() stays stable as profiles appear and never names the shared-memory sidecar', () => {
   const home = makeTempDir('obelisk-hermes-targets-');
   const profilesDir = join(home, 'profiles');
   try {
@@ -766,18 +794,16 @@ test('watchTargets() sorts profile targets, never names a sidecar, and survives 
     assert.deepEqual(provider.watchTargets(home), [
       { kind: 'file', path: join(home, 'state.db') },
       { kind: 'file', path: join(home, 'state.db-wal') },
-      { kind: 'tree', path: profilesDir },
+      { kind: 'tree', path: profilesDir, fileNames: ['state.db', 'state.db-wal'] },
     ], 'a home without a profiles directory still reports the default store and the tree');
 
-    // The enumeration is sorted so the target list is stable across scans.
+    // Discovery enumerates profiles off the main thread; watch targets stay stable.
     for (const name of ['zeta', 'alpha']) mkdirSync(join(profilesDir, name), { recursive: true });
-    const names = provider.watchTargets(home).map(target => target.path);
-    assert.deepEqual(names.slice(3), [
-      join(profilesDir, 'alpha', 'state.db'),
-      join(profilesDir, 'alpha', 'state.db-wal'),
-      join(profilesDir, 'zeta', 'state.db'),
-      join(profilesDir, 'zeta', 'state.db-wal'),
-    ], 'alphabetical by profile name');
+    assert.deepEqual(provider.watchTargets(home), [
+      { kind: 'file', path: join(home, 'state.db') },
+      { kind: 'file', path: join(home, 'state.db-wal') },
+      { kind: 'tree', path: profilesDir, fileNames: ['state.db', 'state.db-wal'] },
+    ]);
 
     // SQLite rewrites the shared-memory sidecar on every read, so it would only ever report
     // events that carry no new rows.
@@ -791,7 +817,7 @@ test('watchTargets() sorts profile targets, never names a sidecar, and survives 
   }
 });
 
-test('watchTargets() falls back to the base targets when the profiles directory cannot be read', (t) => {
+test('watchTargets() does not need to read an inaccessible profiles directory', (t) => {
   const layout = fixtureHome();
   const profilesDir = join(layout.base, 'profiles');
   try {
@@ -804,8 +830,8 @@ test('watchTargets() falls back to the base targets when the profiles directory 
     assert.deepEqual(provider.watchTargets(layout.base), [
       { kind: 'file', path: join(layout.base, 'state.db') },
       { kind: 'file', path: join(layout.base, 'state.db-wal') },
-      { kind: 'tree', path: profilesDir },
-    ], 'an unreadable profiles directory leaves the base targets and throws nothing');
+      { kind: 'tree', path: profilesDir, fileNames: ['state.db', 'state.db-wal'] },
+    ], 'an unreadable profiles directory still has the same watch target');
   } finally {
     chmodSync(profilesDir, 0o700);
     rmSync(layout.base, { recursive: true, force: true });
@@ -1134,6 +1160,53 @@ test('an in-place edit of an existing row moves the cursor, and an idle store do
 
     settle(index);
     assert.equal(index.run().plan.items.length, 0, 'the next pass is idle again');
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+test('a child session token-only update refreshes its indexed subagent total', () => {
+  const layout = fixtureHome();
+  writeStore(layout.primaryPath, db => {
+    db.prepare(`UPDATE sessions SET source = 'subagent', parent_session_id = ?,
+      input_tokens = 1, output_tokens = 2 WHERE id = ?`).run(SESSION_ALPHA, SESSION_BETA);
+  });
+  const provider = createHermesProvider({ rootDir: layout.base, openStore });
+  const index = indexFixture(provider);
+  try {
+    const childId = hermesSessionId(SESSION_BETA, DEFAULT_PROFILE, layout.primaryPath);
+    settle(index);
+    const total = () => index.db.prepare('SELECT total_tokens FROM subagents WHERE agent_id = ?').get(childId)?.total_tokens;
+    assert.equal(total(), 3);
+
+    writeStore(layout.primaryPath, db => {
+      db.prepare('UPDATE sessions SET input_tokens = 10, output_tokens = 20 WHERE id = ?').run(SESSION_BETA);
+    });
+    const changed = index.run();
+    assert.deepEqual(scheduledSessionIds(changed), [childId], 'only the child needs a replay');
+    assert.equal(total(), 30, 'the persisted subagent usage follows the session columns');
+    settle(index);
+    assert.equal(index.run().plan.items.length, 0);
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+test('a schema version-only update refreshes the indexed session version', () => {
+  const layout = fixtureHome();
+  const provider = createHermesProvider({ rootDir: layout.base, openStore });
+  const index = indexFixture(provider);
+  try {
+    const sessionId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
+    settle(index);
+    writeStore(layout.primaryPath, db => {
+      db.prepare('UPDATE schema_version SET version = 29').run();
+    });
+    const changed = index.run();
+    assert.ok(scheduledSessionIds(changed).includes(sessionId));
+    assert.equal(index.db.prepare('SELECT version FROM sessions WHERE id = ?').get(sessionId).version, 'hermes-v29');
   } finally {
     index.close();
     rmSync(layout.base, { recursive: true, force: true });

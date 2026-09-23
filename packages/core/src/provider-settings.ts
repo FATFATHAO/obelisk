@@ -15,6 +15,7 @@ import {
 } from './providers/registry.ts';
 import type { CopilotChronicleOpener } from './providers/copilot.ts';
 import type { HermesStoreOpener } from './providers/hermes.ts';
+import type { ZcodeDatabaseOpener } from './providers/zcode.ts';
 
 export type PersistedProviderSettings = Record<string, unknown> & {
   providerRoots?: Record<string, unknown>;
@@ -123,15 +124,17 @@ export function createConfiguredBuiltinProviderRuntime(
     baseRoots = {},
     openCopilotChronicle,
     openHermesStore,
+    openZcodeDatabase,
   }: {
     homeDir?: string;
     cwd?: string;
     baseRoots?: BuiltinProviderRoots;
     openCopilotChronicle?: CopilotChronicleOpener;
     openHermesStore?: HermesStoreOpener;
+    openZcodeDatabase?: ZcodeDatabaseOpener;
   } = {},
 ): { roots: Record<string, string>; registry: ProviderRegistry } {
-  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, openCopilotChronicle, openHermesStore });
+  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, openCopilotChronicle, openHermesStore, openZcodeDatabase });
   const roots = resolveProviderRoots(defaults, persisted, { homeDir });
   const copilotUsesAutomaticRoots = baseRoots.copilot === undefined
     && !hasExplicitProviderRoot(persisted, 'copilot');
@@ -141,7 +144,7 @@ export function createConfiguredBuiltinProviderRuntime(
       ...roots,
       ...(copilotUsesAutomaticRoots ? { copilot: undefined } : {}),
     },
-    { cwd, openCopilotChronicle, openHermesStore },
+    { cwd, openCopilotChronicle, openHermesStore, openZcodeDatabase },
   );
   return {
     roots,

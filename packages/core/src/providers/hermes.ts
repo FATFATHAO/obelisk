@@ -47,12 +47,10 @@ import { existsSync, readdirSync, statSync } from 'node:fs';
 import { normalizeObservedCwd, projectSlugFromPath, trunc } from '../parsing.ts';
 
 export const name = 'hermes';
-// v5: a session write no longer invalidates every session of its store (the cursor moved from a
-// store-wide signature to a per-session one), and two record shapes changed — a host compaction
-// row is now a summary instead of an invented user/assistant turn, and host bookkeeping rows
-// carry is_meta. An index built by v4 holds rows this adapter would no longer write, so it is
-// replayed.
-export const HERMES_CANONICAL_TRANSCRIPT_MARKER = '__hermes_canonical_transcript_v5__';
+// v6: session token totals and schema version join the per-session fingerprint. Older cursors
+// could certify a store while leaving changed subagent usage or session version stale; replaying
+// once brings those rows current before the new cursor takes over.
+export const HERMES_CANONICAL_TRANSCRIPT_MARKER = '__hermes_canonical_transcript_v6__';
 
 const CURSOR_TAG = 'hermes-snapshot-v2';
 const STORE_FILE = 'state.db';
@@ -269,23 +267,14 @@ function storeMtime(dbPath: string): number {
 
 /**
  * Session-level token totals, for lineage rows only: per-message usage is not recorded upstream.
- * Hermes keeps cache reads/writes and reasoning tokens in their own session columns
- * (`cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`), and its own accounting reports
- * input + output; adding the cache columns here would double-count them.
+ * Older stores may lack these columns; absent values leave the link intact without usage.
+ * Cache and reasoning tokens are already accounted for by the session's input/output totals.
  */
-function sessionTotalTokens(db: SqliteDb, sessionId: string): number | null {
-  try {
-    const row = db
-      .prepare('SELECT input_tokens, output_tokens FROM sessions WHERE id = ?')
-      .get(sessionId);
-    const input = Number(row?.['input_tokens'] ?? 0);
-    const output = Number(row?.['output_tokens'] ?? 0);
-    const total = (Number.isFinite(input) ? input : 0) + (Number.isFinite(output) ? output : 0);
-    return total > 0 ? total : null;
-  } catch {
-    // Older stores may not carry the token columns; the lineage link is still worth recording.
-    return null;
-  }
+function sessionTotalTokens(row: SqliteRow): number | null {
+  const input = Number(row['input_tokens'] ?? 0);
+  const output = Number(row['output_tokens'] ?? 0);
+  const total = (Number.isFinite(input) ? input : 0) + (Number.isFinite(output) ? output : 0);
+  return total > 0 ? total : null;
 }
 
 /** mtime + ctime + size + inode of one store file, per the cursor rule in CONTRIBUTING. */
@@ -455,13 +444,20 @@ function readSchemaVersion(db: SqliteDb): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+const SESSION_COLUMNS = `id, source, model, title, parent_session_id, started_at, ended_at,
+  end_reason, message_count, tool_call_count, cwd, git_branch, profile_name, archived, hidden`;
+
+/** Add optional usage columns only where the source schema has them. */
+function sessionColumns(db: SqliteDb): string {
+  const present = new Set(db.prepare('PRAGMA table_info(sessions)').all().map(row => String(row['name'])));
+  const usage = ['input_tokens', 'output_tokens'].filter(column => present.has(column));
+  return [SESSION_COLUMNS, ...usage].join(', ');
+}
+
 function readSessionRows(db: SqliteDb): SqliteRow[] {
   return db
     .prepare(
-      `SELECT id, source, model, title, parent_session_id, started_at, ended_at, end_reason,
-            message_count, tool_call_count, cwd, git_branch, profile_name, archived, hidden
-     FROM sessions
-     ORDER BY started_at, id`,
+      `SELECT ${sessionColumns(db)} FROM sessions ORDER BY started_at, id`,
     )
     .all();
 }
@@ -524,10 +520,12 @@ function sessionFingerprint(
   profile: string,
   watermark: SqliteRow | undefined,
   parent: string | null,
+  schemaVersion: number,
 ): string {
   return sha256(
     JSON.stringify({
       profile,
+      schemaVersion,
       // Omitted rather than written as null, so a session that never had a parent in this store
       // keeps the fingerprint it already had instead of being replayed once for nothing.
       ...(parent === null ? {} : { parent }),
@@ -546,6 +544,8 @@ function sessionFingerprint(
         row['git_branch'],
         row['archived'],
         row['hidden'],
+        row['input_tokens'] ?? null,
+        row['output_tokens'] ?? null,
       ],
       messages: [
         Number(watermark?.['total'] ?? 0),
@@ -568,8 +568,9 @@ function sessionFingerprintOf(
   row: SqliteRow,
   profile: string,
   parent: string | null,
+  schemaVersion: number,
 ): string {
-  return sessionFingerprint(row, profile, sessionWatermark(db, row['id']), parent);
+  return sessionFingerprint(row, profile, sessionWatermark(db, row['id']), parent, schemaVersion);
 }
 
 /**
@@ -649,7 +650,7 @@ function readStoreSessions(
         row,
         dbPath,
         profile,
-        fingerprint: sessionFingerprint(row, profile, watermarks.get(rawSessionId), parent),
+        fingerprint: sessionFingerprint(row, profile, watermarks.get(rawSessionId), parent, schemaVersion),
       });
     }
     db.exec('COMMIT');
@@ -808,11 +809,13 @@ function hermesParse({ openStore }: HermesParseDeps) {
       // otherwise commit between the session row and the message list, and the adapter
       // would emit "old session metadata + new messages" as one transcript.
       db.exec('BEGIN');
+      const schemaVersion = readSchemaVersion(db);
+      if (schemaVersion !== meta.schemaVersion) {
+        throw new Error(`Hermes schema version changed after discovery: ${meta.rawSessionId}`);
+      }
       const row = db
         .prepare(
-          `SELECT id, source, model, title, parent_session_id, started_at, ended_at, end_reason,
-                message_count, tool_call_count, cwd, git_branch, profile_name, archived, hidden
-         FROM sessions WHERE id = ?`,
+          `SELECT ${sessionColumns(db)} FROM sessions WHERE id = ?`,
         )
         .get(meta.rawSessionId);
       if (!row) throw new Error(`Hermes session disappeared after discovery: ${meta.rawSessionId}`);
@@ -824,7 +827,7 @@ function hermesParse({ openStore }: HermesParseDeps) {
       const parentRow = hasParent ? readParentRow(db, rawParentId!) : undefined;
       const parent = parentSignature(row, parentRow, meta.profileHint);
       // Refuse to write records from a torn read: the next scan reparses the session.
-      const fingerprint = sessionFingerprintOf(db, row, meta.profile, parent);
+      const fingerprint = sessionFingerprintOf(db, row, meta.profile, parent, schemaVersion);
       if (fingerprint !== meta.fingerprint) {
         throw new Error(`Hermes session changed after discovery: ${meta.rawSessionId}`);
       }
@@ -840,12 +843,12 @@ function hermesParse({ openStore }: HermesParseDeps) {
         )
         .all(meta.rawSessionId);
 
-      const totalTokens = hasParent ? sessionTotalTokens(db, meta.rawSessionId) : null;
+      const totalTokens = hasParent ? sessionTotalTokens(row) : null;
 
       // The transaction is the snapshot; this second fingerprint check makes a torn read
       // explicit (a rollback-journal store can still see a commit inside one transaction)
       // instead of trusting the snapshot to be repeated.
-      if (sessionFingerprintOf(db, row, meta.profile, parent) !== fingerprint) {
+      if (sessionFingerprintOf(db, row, meta.profile, parent, schemaVersion) !== fingerprint) {
         throw new Error(`Hermes session changed while it was read: ${meta.rawSessionId}`);
       }
       const digest = digestOfMessages(messages);
@@ -1082,7 +1085,13 @@ function rawHermes(input: RawLookup, openStore?: HermesStoreOpener): RawRecord |
       }
       if (!row) return null;
       const text = JSON.stringify(row, null, 2);
-      return { text: trunc(text), totalLength: text.length };
+      const messageText = projection === 'thinking'
+        ? stringValue(row['reasoning_content']) ?? stringValue(row['reasoning'])
+        : projection === 'message'
+          ? stringValue(row['content'])
+            ?? (stringValue(row['role']) === 'assistant' ? codexMessageText(row) : null)
+          : null;
+      return { text, totalLength: text.length, messageText };
     } finally {
       try {
         db?.close();
@@ -1126,36 +1135,13 @@ export function createHermesProvider({
       const targets: WatchTarget[] = [
         { kind: 'file', path: join(home, STORE_FILE) },
         { kind: 'file', path: join(home, WAL_FILE) },
-        // The tree stays even though every store it holds is named below: it is what reports a
-        // profile directory appearing or being removed, which is a directory event no exact file
-        // target can carry. The caller forwards directory paths and drops plain files there, so a
-        // profile's first read arrives through this target.
-        { kind: 'tree', path: profilesDir },
+        // The caller forwards these store files from the profiles tree and promotes active ones
+        // to its bounded poller. This also covers profiles created after the watcher starts,
+        // without synchronously enumerating the directory on Electron's main thread.
+        { kind: 'tree', path: profilesDir, fileNames: [STORE_FILE, WAL_FILE] },
       ];
-      // A named profile's store is the same kind of file as the default store, so name each one
-      // exactly as well. Without this a write to `profiles/<name>/state.db` is a `.db` file under
-      // the tree, which the caller's transcript filter drops, and the store would wait for the
-      // periodic reconcile instead of being read on the event.
-      //
-      // The list is computed when the service is built, and `startIndexerService()` rebuilds it on
-      // every provider-root change, autoRefresh toggle and post-rebuild restart — so a profile
-      // created while the watcher is already running is not listed yet. That profile is still read
-      // (its directory event reaches the tree target above), but its later writes are covered only
-      // by the periodic reconcile until the list is recomputed or the app restarts. This is a
-      // latency improvement, not the completeness guarantee; the tree target and the reconcile are.
-      //
       // `state.db-shm` is deliberately absent: SQLite rewrites it on every read, so declaring it
       // would only produce events that carry no new rows.
-      try {
-        for (const entry of readdirSync(profilesDir).sort()) {
-          const storePath = join(profilesDir, entry, STORE_FILE);
-          targets.push({ kind: 'file', path: storePath }, { kind: 'file', path: join(profilesDir, entry, WAL_FILE) });
-        }
-      } catch {
-        // Watch targets are a discovery hint, not evidence about the inventory: an absent or
-        // unreadable profiles directory leaves the base targets above, never throws, and never
-        // reports an incomplete inventory. Discovery is what says a source is incomplete.
-      }
       return targets;
     },
     discover(ctx: DiscoverContext): IndexUnit[] {

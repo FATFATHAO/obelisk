@@ -107,11 +107,9 @@ test('caller routes provider-declared exact files regardless of suffix', async (
   }
 });
 
-// Owner's third review: the hermes adapter's own watchTargets() has to put each profile store in
-// front of this caller as an exact file target. A `.db` file under the tree target is dropped by
-// the transcript filter below, so a profile write that is not declared exactly waits for the
-// periodic reconcile — this drives the real provider's list, not a hand-written stand-in.
-test('a hermes profile store is declared exactly and reaches the indexer', async () => {
+// A profile can appear after watcher startup. The tree carries Hermes's exact database names,
+// so its files reach the indexer without a synchronous enumeration on Electron's main thread.
+test('Hermes profile stores reach the indexer through the declared tree file names', async () => {
   let captured = null;
   const ctx = mock.module(WATCHER_URL, {
     namedExports: {
@@ -135,10 +133,10 @@ test('a hermes profile store is declared exactly and reaches the indexer', async
       openStore: () => { throw new Error('the watcher filter must not open a store'); },
     });
     const targets = provider.watchTargets(home);
-    assert.ok(
-      targets.some((target) => target.kind === 'file' && target.path === profileStore),
-      'the real watchTargets() output names the profile store exactly',
-    );
+    assert.deepEqual(targets.find(target => target.kind === 'tree'), {
+      kind: 'tree', path: join(home, 'profiles'), fileNames: ['state.db', 'state.db-wal'],
+    });
+    assert.equal(targets.some(target => target.kind === 'file' && target.path === profileStore), false);
 
     const timers = manualTimers();
     const builds = [];
@@ -151,8 +149,7 @@ test('a hermes profile store is declared exactly and reaches the indexer', async
     });
     service.start({ buildOnStart: false });
 
-    // A declared exact file forwards on the event, suffix or not, and stays out of the hot
-    // overlay because the file poller already pins it.
+    // The tree forwards both SQLite files and promotes them to the bounded hot poller.
     captured.onInvalidate({ type: 'paths', paths: [`${profileStore}-wal`] });
     timers.flush();
     await new Promise((resolve) => setImmediate(resolve));
@@ -161,23 +158,29 @@ test('a hermes profile store is declared exactly and reaches the indexer', async
       [`${profileStore}-wal`],
       'a profile store update reaches the indexer',
     );
-    assert.equal(captured.shouldPromote(profileStore), false, 'a pinned exact file stays out of the hot overlay');
+    assert.equal(captured.shouldPromote(profileStore), true);
+    assert.equal(captured.shouldPromote(`${profileStore}-wal`), true);
+    assert.equal(captured.shouldPromote(`${profileStore}-shm`), false);
 
-    // Contrast: a profile that appeared after the target list was computed is only a `.db` file
-    // under the tree, and the caller still filters those (the suffix filter is not switched off).
+    // A profile created later is covered without rebuilding the target list.
     const lateStore = join(home, 'profiles', 'late', 'state.db');
     mkdirSync(join(home, 'profiles', 'late'), { recursive: true });
     writeFileSync(lateStore, 'sqlite fixture');
     captured.onInvalidate({ type: 'paths', paths: [lateStore] });
-    for (let i = 0; i < 8; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      timers.flush();
-    }
+    timers.flush();
+    await new Promise((resolve) => setImmediate(resolve));
     assert.equal(
       builds.flatMap((build) => build.changedPaths ?? []).includes(lateStore),
-      false,
-      'an undeclared database file under the tree is still filtered out',
+      true,
+      'a newly created profile database reaches the indexer immediately',
     );
+    const stray = join(home, 'profiles', 'late', 'other.db');
+    writeFileSync(stray, 'not a provider store');
+    assert.equal(captured.shouldPromote(stray), false, 'other databases stay out of the hot overlay');
+    captured.onInvalidate({ type: 'paths', paths: [stray] });
+    await new Promise((resolve) => setImmediate(resolve));
+    timers.flush();
+    assert.equal(builds.flatMap(build => build.changedPaths ?? []).includes(stray), false);
     service.stop();
   } finally {
     ctx.restore();
