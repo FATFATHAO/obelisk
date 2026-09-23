@@ -656,6 +656,42 @@ test('raw() returns the exact Hermes row as evidence, and null when it cannot be
   }
 });
 
+test('raw() finds an indexed tool call after malformed or non-object tool_calls', () => {
+  const layout = fixtureHome();
+  writeStore(layout.primaryPath, db => {
+    const insert = db.prepare(`
+      INSERT INTO messages (id, session_id, role, tool_calls, timestamp)
+      VALUES (?, ?, 'assistant', ?, ?)
+    `);
+    insert.run(-2, SESSION_ALPHA, '{"entry":{"call_id":"call-1"}}', 1767225499);
+    insert.run(-1, SESSION_ALPHA, '{broken', 1767225500);
+    insert.run(0, SESSION_ALPHA, '["not-an-object"]', 1767225501);
+  });
+  const provider = createHermesProvider({ rootDir: layout.base, openStore });
+  const index = indexFixture(provider);
+  try {
+    settle(index);
+    const sessionId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
+    const toolId = `${sessionId}:tool:call-1`;
+    assert.ok(
+      index.db.prepare('SELECT id FROM tool_calls WHERE id = ?').get(toolId),
+      'normal projection skips malformed entries and indexes the later valid call',
+    );
+
+    const raw = provider.raw({
+      source: 'hermes',
+      messageUuid: toolId,
+      session: { jsonl_path: `${layout.primaryPath}#session:${SESSION_ALPHA}` },
+      agentId: null,
+    });
+    assert.ok(raw, 'the same valid call remains available through raw lookup');
+    assert.match(raw.text, /read_file/);
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
 test('raw() resolves an indexed Hermes store when its configured home contains #', () => {
   const layout = fixtureHome();
   const home = `${layout.base}#custom`;

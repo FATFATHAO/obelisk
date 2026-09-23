@@ -1042,9 +1042,16 @@ function rawHermes(input: RawLookup, openStore?: HermesStoreOpener): RawRecord |
       if (projection === 'tool') {
         row = db
           .prepare(
-            `SELECT m.* FROM messages m, json_each(m.tool_calls) AS call
+            // Projection ignores malformed tool_calls and non-object entries. Raw lookup must
+            // use the same rule, or one bad earlier row hides a later valid tool call.
+            `SELECT m.* FROM messages m,
+               json_each(CASE WHEN json_valid(m.tool_calls) THEN
+                 CASE WHEN json_type(m.tool_calls) = 'array' THEN m.tool_calls ELSE '[]' END
+               ELSE '[]' END) AS call
            WHERE m.session_id = ?
-             AND (json_extract(call.value, '$.call_id') = ? OR json_extract(call.value, '$.id') = ?)
+             AND CASE WHEN call.type = 'object' THEN
+               (json_extract(call.value, '$.call_id') = ? OR json_extract(call.value, '$.id') = ?)
+             ELSE 0 END
            LIMIT 1`,
           )
           .get(rawSessionId, rawId, rawId);
@@ -1225,11 +1232,9 @@ export function createHermesProvider({
               || cursor.fingerprint !== session.fingerprint
               || forcedSessions.has(rawSessionId)
             ) {
-              // A new, grown or superseded session — or one the index no longer holds. The cursor
-              // alone cannot answer the last case: a store that went away and came back is
-              // retracted by the store-level path, but the session's cursor outlives the
-              // retraction and still matches the rows it would project, so the session would be
-              // skipped and the store would be re-read on every scan without ever converging.
+              // A new, grown or superseded session — or one the index no longer holds. A cursor
+              // can outlive its canonical session row, so matching fingerprint alone cannot
+              // certify that the session is still indexed.
               // parse() re-derives the fingerprint it hands back, so the cursor here only has to
               // be the one discovery believes in.
               scheduled.push({
