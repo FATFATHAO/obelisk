@@ -253,12 +253,9 @@ function fixtureHome({ wal = false } = {}) {
 
 /**
  * Sessions of a discovery. A store also reports one gate unit carrying no records — the same
- * `__`-prefixed kind of row the provider markers use — and the missing-store marker is a second
- * such pseudo row. Neither is ever a session.
+ * `__`-prefixed kind of row the provider markers use. It is not a session.
  */
-const sessionUnits = units => units.filter(
-  unit => unit.meta.storeGate !== true && unit.meta.missingStoreMarker === undefined,
-);
+const sessionUnits = units => units.filter(unit => unit.meta.storeGate !== true);
 
 const indexedFrom = units => sessionUnits(units).map(unit => ({
   sessionId: unit.sessionId,
@@ -449,10 +446,10 @@ test('an index written under the previous canonical marker is replayed after the
     const writeMarker = db.prepare(
       'INSERT INTO index_state (jsonl_path, mtime, lines_processed, cursor) VALUES (?, 0, 0, ?)',
     );
-    writeMarker.run('__hermes_canonical_transcript_v5__', '0:0:hermes-snapshot-v2:stale');
+    writeMarker.run('__hermes_canonical_transcript_v6__', '0:0:hermes-snapshot-v2:stale');
 
     const stale = createProviderIndexPlan(db, registry);
-    assert.equal(stale.pendingMarkers.get('hermes'), '__hermes_canonical_transcript_v6__');
+    assert.equal(stale.pendingMarkers.get('hermes'), '__hermes_canonical_transcript_v7__');
     assert.deepEqual(stale.replayKeys.get('hermes'), [unit.key], 'the previously indexed unit replays');
     assert.equal(
       stale.items.find(item => item.unit.key === unit.key).cursor,
@@ -461,7 +458,7 @@ test('an index written under the previous canonical marker is replayed after the
     );
 
     // Once the current marker is present the index has converged: no marker, no replay.
-    writeMarker.run('__hermes_canonical_transcript_v6__', '0:0:hermes-snapshot-v2:current');
+    writeMarker.run('__hermes_canonical_transcript_v7__', '0:0:hermes-snapshot-v2:current');
     const settled = createProviderIndexPlan(db, registry);
     assert.equal(settled.pendingMarkers.get('hermes'), undefined);
     assert.equal(settled.replayKeys.get('hermes'), undefined);
@@ -656,6 +653,31 @@ test('raw() returns the exact Hermes row as evidence, and null when it cannot be
     }), null, 'an unreadable store is evidence-less, never an exception');
   } finally {
     rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+test('raw() resolves an indexed Hermes store when its configured home contains #', () => {
+  const layout = fixtureHome();
+  const home = `${layout.base}#custom`;
+  renameSync(layout.base, home);
+  const dbPath = join(home, 'state.db');
+  const provider = createHermesProvider({ rootDir: home, openStore });
+  const index = indexFixture(provider);
+  try {
+    settle(index);
+    const sessionId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, dbPath);
+    const uuid = `${sessionId}:message:${layout.ids.assistant}`;
+    const api = createQueryApi(index.db, { providerRegistry: createProviderRegistry([provider]) });
+    const raw = api.raw(uuid);
+    assert.ok(raw, 'the indexed message retains its raw source');
+    assert.match(raw.text, /Reading the file/);
+    assert.equal(provider.raw({
+      source: 'hermes', messageUuid: uuid,
+      session: { jsonl_path: `${dbPath}#session:${SESSION_ALPHA}` }, agentId: null,
+    })?.messageText, 'Reading the file', 'the App can expand its full text');
+  } finally {
+    index.close();
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -1166,6 +1188,44 @@ test('an in-place edit of an existing row moves the cursor, and an idle store do
   }
 });
 
+test('a reasoning rewrite with delimiter characters still changes the exact digest', () => {
+  const layout = fixtureHome();
+  writeStore(layout.primaryPath, db => {
+    db.prepare('UPDATE messages SET reasoning = ?, reasoning_content = ? WHERE id = ?')
+      .run('a\u0001b', 'c', layout.ids.assistant);
+  });
+  const provider = createHermesProvider({ rootDir: layout.base, openStore });
+  const index = indexFixture(provider);
+  try {
+    const alphaId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
+    const thinkingUuid = `${alphaId}:thinking:${layout.ids.assistant}`;
+    const baselineMtime = new Date(1767225600000);
+    utimesSync(layout.primaryPath, baselineMtime, baselineMtime);
+    settle(index);
+    assert.equal(index.db.prepare('SELECT text FROM messages WHERE uuid = ?').get(thinkingUuid).text, 'c');
+
+    // Both states have the same watermark and the old delimiter encoding produced identical
+    // digest bytes: "a\u0001b\u0001c". The changed mtime forces an exact digest comparison.
+    writeStore(layout.primaryPath, db => {
+      db.prepare('UPDATE messages SET reasoning = ?, reasoning_content = ? WHERE id = ?')
+        .run('a', 'b\u0001c', layout.ids.assistant);
+    });
+    const changedMtime = new Date(1767225601000);
+    utimesSync(layout.primaryPath, changedMtime, changedMtime);
+
+    const round = index.run();
+    assert.deepEqual(scheduledSessionIds(round), [alphaId], 'the changed session is reindexed');
+    assert.equal(
+      index.db.prepare('SELECT text FROM messages WHERE uuid = ?').get(thinkingUuid).text,
+      'b\u0001c',
+      'the index holds the new projected thinking text',
+    );
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
 test('a child session token-only update refreshes its indexed subagent total', () => {
   const layout = fixtureHome();
   writeStore(layout.primaryPath, db => {
@@ -1652,12 +1712,9 @@ test('a session whose store disappeared and came back is indexed again', () => {
   }
 });
 
-// Blocker ②: an indexed store whose file is gone is not yet evidence that its sessions were
-// deleted. Hermes quarantines and replaces `state.db` (upstream docs/state-db-recovery.md), so the
-// first scan only records the sighting under the store's `__`-prefixed pseudo key, where the
-// history hint reader cannot mistake it for a transcript. A store still missing on the next scan
-// is a stable absence, and only then do its sessions retract.
-test('a deleted store retracts its sessions only after a second, stable scan', () => {
+// Issue #196: a missing store is an incomplete inventory, even after repeated scans. Hermes may
+// quarantine and replace `state.db`; elapsed scans cannot prove its sessions were deleted.
+test('a missing store reports incomplete inventory and never retracts indexed sessions', () => {
   const layout = fixtureHome();
   const index = indexFixture(createHermesProvider({ rootDir: layout.base, openStore }));
   const alphaId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
@@ -1666,40 +1723,44 @@ test('a deleted store retracts its sessions only after a second, stable scan', (
   try {
     settle(index);
     assert.ok(holdsAlpha(), 'the session is indexed to start');
+    const before = index.db.prepare('SELECT id FROM sessions WHERE source = ? ORDER BY id')
+      .all('hermes').map(row => String(row.id));
 
     rmSync(layout.primaryPath, { force: true });
-
-    const first = index.run();
-    assert.ok(holdsAlpha(), 'one scan that sees the store missing is not evidence of a deletion');
-    assert.equal(
-      scheduledSessionIds(first).length,
-      0,
-      'no session is scheduled from an inventory that cannot be proved',
-    );
-    assert.equal(
-      first.plan.items.some(item => item.unit.meta.missingStoreMarker === 'absent'),
-      true,
-      'the sighting is recorded under the store pseudo key instead',
-    );
-
-    index.run();
-    assert.equal(holdsAlpha(), false, 'a store still missing on the next scan retracts its sessions');
+    for (let scan = 0; scan < 3; scan += 1) {
+      const round = index.run();
+      assert.ok(holdsAlpha(), `scan ${scan + 1} keeps the last indexed session`);
+      assert.equal(scheduledSessionIds(round).length, 0, 'unreadable evidence schedules no session');
+      assert.ok(
+        round.plan.inventoryIssues.some(issue => issue.path === layout.primaryPath),
+        'the missing store is reported as an incomplete inventory',
+      );
+      assert.equal(
+        round.plan.items.some(item => item.unit.meta.tombstone === true),
+        false,
+        'no provider session is retracted',
+      );
+    }
     assert.deepEqual(
-      index.db.prepare('SELECT id FROM sessions WHERE source = ?').all('hermes').map(row => String(row.id)),
-      [hermesSessionId(SESSION_PROFILE, 'coder', layout.profilePath)],
-      'the store that is really there keeps its session, and nothing else survives',
+      index.db.prepare('SELECT id FROM sessions WHERE source = ? ORDER BY id')
+        .all('hermes').map(row => String(row.id)),
+      before,
+      'the indexed snapshot stays available while the store is missing',
     );
-    assert.equal(index.run().plan.items.length, 0, 'and the index settles');
+    assert.ok(
+      index.db.prepare('SELECT uuid FROM messages WHERE session_id = ? LIMIT 1').get(alphaId),
+      'previously indexed message text is still available',
+    );
   } finally {
     index.close();
     rmSync(layout.base, { recursive: true, force: true });
   }
 });
 
-// Blocker ③: moving a profile store to another profile makes a new identity out of the same rows.
-// The old identity has to be retracted once its absence is stable and the new one indexed, without
-// both lingering — the rows=2 state Nox saw that never converged.
-test('a profile store renamed to another profile converges without duplicating its session', () => {
+// A store path is part of session identity. When the old profile directory remains but its
+// state.db moves elsewhere, the old inventory is incomplete; preserving its last snapshot can
+// temporarily display both identities. Removing the old directory is the explicit retraction.
+test('a profile store moved while its old directory remains keeps the old snapshot', () => {
   const layout = fixtureHome();
   const index = indexFixture(createHermesProvider({ rootDir: layout.base, openStore }));
   const otherDir = join(layout.base, 'profiles', 'other');
@@ -1718,51 +1779,55 @@ test('a profile store renamed to another profile converges without duplicating i
     mkdirSync(otherDir, { recursive: true });
     renameSync(layout.profilePath, otherPath);
 
+    const missing = index.run();
+    assert.ok(
+      missing.plan.inventoryIssues.some(issue => issue.path === layout.profilePath),
+      'the old path is reported as an incomplete inventory',
+    );
     settle(index, 8);
-    assert.equal(hermesIds().includes(oldId), false, 'the old identity is retracted');
+    assert.equal(hermesIds().includes(oldId), true, 'the old indexed identity is preserved');
     assert.equal(hermesIds().includes(newId), true, 'the new identity is indexed');
-    assert.equal(hermesIds().length, 3, 'and the same session is not left in the index twice');
-    assert.equal(index.run().plan.items.length, 0, 'the index settles');
+    assert.equal(hermesIds().length, 4, 'the two path-scoped identities can coexist');
+
+    rmSync(join(layout.base, 'profiles', 'coder'), { recursive: true, force: true });
+    settle(index, 8);
+    assert.equal(hermesIds().includes(oldId), false, 'removing the old profile retracts its identity');
+    assert.equal(hermesIds().length, 3, 'the remaining store has one profile session');
+    assert.equal(index.run().plan.items.length, 0, 'the index settles after the profile removal');
   } finally {
     index.close();
     rmSync(layout.base, { recursive: true, force: true });
   }
 });
 
-// Blocker ②, the other half: the sighting has to be cleared when the store comes back, or a
-// reverted quarantine would retract at the next absence one scan early.
-test('a store missing for one scan and then restored retracts nothing', () => {
+// Once the store can be read again its complete inventory is authoritative: sessions actually
+// removed from the restored image can now be retracted, while the remaining session stays live.
+test('a restored store reconciles a deleted session after missing scans kept the old index', () => {
   const layout = fixtureHome();
   const away = `${layout.primaryPath}.away`;
   const index = indexFixture(createHermesProvider({ rootDir: layout.base, openStore }));
   const alphaId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
+  const betaId = hermesSessionId(SESSION_BETA, DEFAULT_PROFILE, layout.primaryPath);
   const holdsAlpha = () => index.db
     .prepare('SELECT id FROM sessions WHERE id = ?').get(alphaId) !== undefined;
-  const retracted = [];
-  const run = () => {
-    const round = index.run();
-    for (const item of round.plan.items) {
-      if (item.unit.meta.tombstone === true) retracted.push(item.unit.sessionId);
-    }
-    return round;
-  };
   try {
     settle(index);
 
     renameSync(layout.primaryPath, away);
-    run();
+    index.run();
+    index.run();
+    assert.ok(holdsAlpha(), 'repeated missing scans preserve the last indexed snapshot');
+
+    writeStore(away, db => {
+      db.prepare('DELETE FROM messages WHERE session_id = ?').run(SESSION_ALPHA);
+      db.prepare('DELETE FROM sessions WHERE id = ?').run(SESSION_ALPHA);
+    });
     renameSync(away, layout.primaryPath);
     settle(index, 8);
 
-    assert.deepEqual(retracted, [], 'a transient absence never retracts');
-    assert.ok(holdsAlpha(), 'the session stays indexed');
-
-    // The marker is gone once the store is back, so the next absence has to prove itself again.
-    renameSync(layout.primaryPath, away);
-    run();
-    assert.ok(holdsAlpha(), 'the next absence still retracts nothing on its first scan');
-    run();
-    assert.equal(holdsAlpha(), false, 'and is confirmed only by the second');
+    assert.equal(holdsAlpha(), false, 'the restored store proves the session was deleted');
+    assert.ok(index.db.prepare('SELECT id FROM sessions WHERE id = ?').get(betaId));
+    assert.equal(index.run().plan.items.length, 0, 'the restored inventory settles');
   } finally {
     rmSync(away, { recursive: true, force: true });
     index.close();
@@ -1798,11 +1863,6 @@ test('a store that cannot be described reports an incomplete inventory instead o
         issues.some(issue => issue.path === layout.profilePath),
         true,
         'the store is named as an incomplete inventory',
-      );
-      assert.equal(
-        blocked.some(unit => unit.meta.missingStoreMarker !== undefined),
-        false,
-        'an unreadable store is not mistaken for a missing one',
       );
       assert.deepEqual(
         blocked.filter(unit => unit.meta.tombstone === true).map(unit => unit.sessionId),

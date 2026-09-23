@@ -47,10 +47,10 @@ import { existsSync, readdirSync, statSync } from 'node:fs';
 import { normalizeObservedCwd, projectSlugFromPath, trunc } from '../parsing.ts';
 
 export const name = 'hermes';
-// v6: session token totals and schema version join the per-session fingerprint. Older cursors
-// could certify a store while leaving changed subagent usage or session version stale; replaying
-// once brings those rows current before the new cursor takes over.
-export const HERMES_CANONICAL_TRANSCRIPT_MARKER = '__hermes_canonical_transcript_v6__';
+// v7: the exact message digest now frames every projected field unambiguously. An older digest
+// could mistake a control character in reasoning text for a field boundary, certify the store,
+// and leave changed thinking text stale. Replay those sessions before trusting the new digest.
+export const HERMES_CANONICAL_TRANSCRIPT_MARKER = '__hermes_canonical_transcript_v7__';
 
 const CURSOR_TAG = 'hermes-snapshot-v2';
 const STORE_FILE = 'state.db';
@@ -58,20 +58,11 @@ const WAL_FILE = `${STORE_FILE}-wal`;
 const PROFILES_DIR = 'profiles';
 const SUPPORTED_SCHEMA_VERSION = 30;
 const TOMBSTONE_CURSOR = '0:0:hermes-tombstone';
-// A store file that is missing for one scan is not yet evidence its sessions were deleted: the host
-// quarantines and replaces `state.db` (its own `docs/state-db-recovery.md`), so a scan that sees it
-// absent only records the sighting under a `__`-prefixed pseudo key (the convention the store gate
-// and the provider markers already use, invisible to `readRecentTranscriptHints`). A store still
-// missing on the next scan is a stable absence, and only then does the tombstone path run. The
-// second sentinel clears the marker once the store is back, so a later absence proves itself again.
-const MISSING_STORE_CURSOR = '0:0:hermes-missing-store';
-const PRESENT_STORE_CURSOR = '0:0:hermes-store-present';
 const SESSION_PATH_PREFIX = 'session:';
 // The store gate lives in `index_state` under a `__`-prefixed pseudo key, the way the
 // provider markers do: `readRecentTranscriptHints` skips `__` keys, so it is never
 // mistaken for a transcript path, and a force rebuild recreates it with everything else.
 const STORE_GATE_PREFIX = '__hermes_store_v1__:';
-const MISSING_STORE_PREFIX = '__hermes_missing_store_v1__:';
 const STORE_CURSOR_TAG = 'hermes-store-v1';
 
 // CLI-side read-only opener
@@ -101,11 +92,6 @@ interface HermesUnitMeta {
   tombstone?: boolean;
   /** Set on the store-level gate unit, which carries no records. */
   storeGate?: boolean;
-  /**
-   * Set on the unit that maintains a missing store's pseudo row: `absent` records the sighting,
-   * `present` clears it once the store is back. Neither carries records.
-   */
-  missingStoreMarker?: 'absent' | 'present';
 }
 
 /** One session of a store read, with the identity and stored cursor discovery compares it by. */
@@ -302,10 +288,6 @@ function storeGateKey(dbPath: string): string {
   return `${STORE_GATE_PREFIX}${sha256(`${STORE_CURSOR_TAG}\0${normalize(dbPath)}`)}`;
 }
 
-function missingStoreKey(dbPath: string): string {
-  return `${MISSING_STORE_PREFIX}${sha256(`${MISSING_STORE_PREFIX}\0${normalize(dbPath)}`)}`;
-}
-
 /**
  * Whether the store file is there, gone, or there but not describable. `existsSync` answers the
  * first two and folds EACCES on any component into "absent", which must not be read as a deletion
@@ -319,26 +301,6 @@ function storeFileState(dbPath: string): 'present' | 'missing' | 'unreadable' {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'unreadable';
   }
-}
-
-/** A record-less unit that writes the missing-store pseudo row (or clears it). */
-function missingStoreUnit(dbPath: string, key: string, cursor: Cursor): IndexUnit {
-  return {
-    key,
-    sessionId: '',
-    meta: {
-      dbPath,
-      profile: '',
-      profileHint: null,
-      rawSessionId: '',
-      sessionId: '',
-      cwd: null,
-      fingerprint: '',
-      schemaVersion: 0,
-      currentCursor: cursor,
-      missingStoreMarker: cursor === MISSING_STORE_CURSOR ? 'absent' : 'present',
-    } satisfies HermesUnitMeta,
-  };
 }
 
 interface HermesStoreCursor {
@@ -588,9 +550,16 @@ function digestOfMessages(rows: readonly SqliteRow[]): string {
   for (const row of rows) {
     for (const column of PROJECTED_MESSAGE_COLUMNS) {
       const value = row[column];
-      // A NULL and an empty string are different states upstream, so they stay different here.
-      hash.update(value === null || value === undefined ? '\u0000' : String(value));
-      hash.update('\u0001');
+      if (value === null || value === undefined) {
+        hash.update('N');
+        continue;
+      }
+      // A separator can occur inside provider text. Type and byte-length frames make the digest
+      // unambiguous even for NUL, control characters, and a rewritten pair of adjacent columns.
+      const bytes = value instanceof Uint8Array ? value : Buffer.from(String(value));
+      const type = value instanceof Uint8Array ? 'B' : typeof value;
+      hash.update(`${type}:${bytes.byteLength}:`);
+      hash.update(bytes);
     }
     hash.update('\u0002');
   }
@@ -790,8 +759,6 @@ function hermesParse({ openStore }: HermesParseDeps) {
     // The store gate unit carries no records: parse() only hands back the gate it wrote, so
     // persist() refreshes the pseudo row the next discovery skips on.
     if (meta.storeGate === true) return meta.currentCursor;
-    // The missing-store marker is a pseudo row like the gate: it writes a cursor and no records.
-    if (meta.missingStoreMarker !== undefined) return meta.currentCursor;
     if (openStore === undefined) throw new Error('No read-only Hermes store opener is configured');
 
     let db: SqliteDb | null = null;
@@ -1051,13 +1018,16 @@ function rawHermes(input: RawLookup, openStore?: HermesStoreOpener): RawRecord |
   if (openStore === undefined) return null;
   try {
     const sessionPath = stringValue((input.session ?? {})['jsonl_path'] as unknown);
-    if (sessionPath === null || !sessionPath.includes('#')) return null;
-    const dbPath = sessionPath.slice(0, sessionPath.indexOf('#'));
+    if (sessionPath === null) return null;
+    // A configured Hermes home may itself contain '#'. The source-path delimiter is the final
+    // '#session:' (raw ids are URI-encoded), not the first hash character in the filesystem path.
+    const separator = `#${SESSION_PATH_PREFIX}`;
+    const separatorAt = sessionPath.lastIndexOf(separator);
+    if (separatorAt < 0) return null;
+    const dbPath = sessionPath.slice(0, separatorAt);
     // The row we return must belong to the session that asked for it: tool call ids are only
     // unique within a session (retries reuse them), so every lookup is session-scoped.
-    const sessionIdPart = sessionPath.slice(sessionPath.indexOf('#') + 1);
-    if (!sessionIdPart.startsWith(SESSION_PATH_PREFIX)) return null;
-    const rawSessionId = decodeURIComponent(sessionIdPart.slice(SESSION_PATH_PREFIX.length));
+    const rawSessionId = decodeURIComponent(sessionPath.slice(separatorAt + separator.length));
     // `summary` resolves like a message: a compaction summary is its own row, so the exact row
     // is the evidence for it too.
     const match = /:(message|thinking|tool|summary):([^:]+)$/.exec(input.messageUuid);
@@ -1168,33 +1138,15 @@ export function createHermesProvider({
         for (const issue of listing.errors) reportIssue(issue.path, issue.error);
         for (const { dbPath, profile } of listing.stores) {
           const dbIndexed = indexed.filter(session => session.jsonlPath.startsWith(`${dbPath}#`));
-          const missingKey = missingStoreKey(dbPath);
-          // A store whose file is gone: the host may have quarantined it, so the first sighting only
-          // records that under its pseudo key and retracts nothing. A store still missing on the
-          // next scan is a stable absence — no issue is reported, the sessions stay out of
-          // `liveSessionIds`, and the tombstone loop at the end of discovery retracts them.
-          const wasMissing = ctx.lastCursor(missingKey) === MISSING_STORE_CURSOR;
+          // A missing store may have been quarantined or temporarily unmounted. Without a
+          // readable inventory, no scan can prove its sessions were deleted, so keep the last
+          // indexed snapshot and reconcile it when the store is available again.
           const fileState = storeFileState(dbPath);
           if (fileState !== 'present') {
             if (dbIndexed.length > 0) {
-              if (fileState === 'unreadable') {
-                // The file is there and cannot be described: an incomplete inventory, never a
-                // deletion, whether or not a missing-store sighting came before it.
-                reportIssue(dbPath, 'Previously indexed Hermes store is unavailable');
-              } else if (!wasMissing) {
-                // A first sighting proves nothing: record it under the pseudo key and keep the
-                // sessions live for this round, so the tombstone loop below cannot reach them.
-                units.push(missingStoreUnit(dbPath, missingKey, MISSING_STORE_CURSOR));
-                for (const session of dbIndexed) liveSessionIds.add(session.sessionId);
-              }
-              // A store still missing on a later scan is a stable absence: it stays out of
-              // `liveSessionIds` and the tombstone loop retracts its sessions.
+              reportIssue(dbPath, 'Previously indexed Hermes store is unavailable');
             }
             continue;
-          }
-          if (wasMissing) {
-            // The store is back: clear the pseudo row so a later absence has to prove itself again.
-            units.push(missingStoreUnit(dbPath, missingKey, PRESENT_STORE_CURSOR));
           }
           if (openStore === undefined) {
             reportIssue(dbPath, 'No read-only Hermes store opener is configured');
