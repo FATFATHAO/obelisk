@@ -325,12 +325,16 @@ function buildIndex({
       const openCopilotChronicle = (sourcePath: string) => new (
         DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean }) => any
       )(sourcePath, { readonly: true, fileMustExist: true });
+      const openHermesStore = (sourcePath: string) => new (
+        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean }) => any
+      )(sourcePath, { readonly: true, fileMustExist: true });
       const registry = providerRegistry
         ?? (providerSettings === undefined
-          ? createBuiltinProviderRegistry(roots, { openCopilotChronicle })
+          ? createBuiltinProviderRegistry(roots, { openCopilotChronicle, openHermesStore })
           : createConfiguredBuiltinProviderRuntime(providerSettings, {
             baseRoots: roots,
             openCopilotChronicle,
+            openHermesStore,
           }).registry);
       const providerPlan = createProviderIndexPlan(db, registry, {
         force,
