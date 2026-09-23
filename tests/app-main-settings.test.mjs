@@ -338,6 +338,8 @@ test('main process watches every root declared by the built-in provider registry
       { kind: 'file', path: join(home, '.kimi-code', 'session_index.jsonl') },
       { kind: 'tree', path: join(home, '.omp', 'agent', 'sessions') },
       { kind: 'tree', path: join(home, '.pi', 'agent', 'sessions') },
+      { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite') },
+      { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite-wal') },
     ]);
     assert.equal(serviceOptions[0].watchTargets.some((t) => t.path === codexDir), false);
     await serviceOptions[0].buildIndex({ reason: 'settings-transfer' });
@@ -593,6 +595,18 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
   `).run('claude-undated-message', 'claude-session', 'assistant', 'assistant', 'ok', 7, 0, 'claude');
   setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)')
     .run('pi:session', 'pi');
+  setup.prepare('INSERT INTO sessions (id,source,jsonl_path) VALUES (?,?,?)')
+    .run('zcode:session', 'zcode', '/tmp/zcode/db/db.sqlite#z:session');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,source) VALUES (?,?,?,?,?,?)')
+    .run('zcode:full-text', 'zcode:session', 'assistant', 'assistant', 'truncated text', 'zcode');
+  setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)')
+    .run('zcode:child', 'zcode');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,visibility,source,agent_id) VALUES (?,?,?,?,?,?,?,?)')
+    .run('zcode:child:message', 'zcode:child', 'assistant', 'assistant', 'child response', 'visible', 'zcode', 'zcode:child');
+  setup.prepare('INSERT INTO tool_calls (id,message_uuid,session_id,name,input_json) VALUES (?,?,?,?,?)')
+    .run('zcode:child:call', 'zcode:child:message', 'zcode:child', 'Read', '{}');
+  setup.prepare('INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content) VALUES (?,?,?,?)')
+    .run('zcode:child:call', 'zcode:child:message', 'zcode:child', 'read result');
   setup.prepare(`
     INSERT INTO summaries (
       id, session_id, timestamp, source, content, visibility, input_tokens, output_tokens
@@ -683,7 +697,17 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
-    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+    [INDEXER_WORKER_URL, { namedExports: {
+      createWorkerBuildIndex: () => ({
+        buildIndex: async () => ({ files: 0, affectedSessionIds: [] }),
+        readZcodeMessageText: async lookup => {
+          assert.equal(lookup.source, 'zcode');
+          assert.equal(lookup.messageUuid, 'zcode:full-text');
+          return 'complete ZCode text from worker';
+        },
+        stop() {},
+      }),
+    } }],
   ]);
 
   try {
@@ -702,6 +726,12 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
       ipcHandlers.get('db:getSessionToolResults')(null, 'pi:session').map(row => row.tool_use_id),
       ['pi-visible-main-call'],
     );
+    assert.deepEqual(ipcHandlers.get('db:getSessionMessages')(null, 'zcode:child').map(row => row.uuid),
+      ['zcode:child:message'], 'first-class child detail includes its self-agent message');
+    assert.deepEqual(ipcHandlers.get('db:getSessionToolCalls')(null, 'zcode:child').map(row => row.id),
+      ['zcode:child:call']);
+    assert.deepEqual(ipcHandlers.get('db:getSessionToolResults')(null, 'zcode:child').map(row => row.tool_use_id),
+      ['zcode:child:call']);
     assert.deepEqual(ipcHandlers.get('db:getSubagentMessages')(null, 'pi:hidden-agent'), []);
     assert.deepEqual(ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:hidden-agent'), []);
     assert.deepEqual(ipcHandlers.get('db:getSubagentToolResults')(null, 'pi:hidden-agent'), []);
@@ -720,7 +750,9 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     const patch = ipcHandlers.get('db:getSessionPatch')(null, 'pi:session', {});
     assert.equal(patch.changes.messages[0].tool_calls[0].result.content, 'main result');
     assert.equal(JSON.stringify(patch).includes('agent result'), false);
-    assert.equal(ipcHandlers.get('db:getMessageFullText')(null, 'pi-hidden-main'), null);
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'pi-hidden-main'), null);
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'zcode:full-text'),
+      'complete ZCode text from worker');
 
     const claudeOnly = ipcHandlers.get('db:getUsageStats')(null, {});
     assert.equal(claudeOnly.totalTokens, 72);

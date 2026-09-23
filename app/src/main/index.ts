@@ -99,6 +99,11 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
       readonly: true,
       fileMustExist: true,
     }),
+    openZcodeDatabase: sourcePath => new Database(sourcePath, {
+      readonly: true,
+      fileMustExist: true,
+      timeout: 500,
+    }),
   });
   const providerRoots = runtime.roots;
   const providerRegistry = runtime.registry;
@@ -534,7 +539,7 @@ function querySessionMessages(sessionId: string): SessionMessageRow[] {
            m.is_sidechain, m.agent_id, m.input_tokens, m.output_tokens, m.cwd, m.skill, m.turn_duration_ms,
            m.content_type, m.is_meta, m.visibility, m.source
     FROM messages m
-    WHERE m.session_id = ? AND m.agent_id IS NULL
+    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
       AND COALESCE(m.visibility, 'visible') = 'visible'
     ORDER BY m.timestamp, m.uuid
   `).all(sessionId) as SessionMessageRow[];
@@ -545,7 +550,7 @@ function querySessionToolCalls(sessionId: string): SessionToolCallRow[] {
   return db.prepare(`
     SELECT tc.* FROM messages m
     CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
-    WHERE m.session_id = ? AND m.agent_id IS NULL
+    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
       AND COALESCE(m.visibility, 'visible') = 'visible'
       AND tc.session_id = ?
   `).all(sessionId, sessionId) as SessionToolCallRow[];
@@ -556,7 +561,7 @@ function querySessionToolResults(sessionId: string): SessionToolResultRow[] {
   return db.prepare(`
     SELECT tr.* FROM messages m
     CROSS JOIN tool_results tr ON tr.message_uuid = m.uuid
-    WHERE m.session_id = ? AND m.agent_id IS NULL
+    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
       AND COALESCE(m.visibility, 'visible') = 'visible'
       AND tr.session_id = ?
   `).all(sessionId, sessionId) as SessionToolResultRow[];
@@ -716,7 +721,7 @@ ipcMain.handle('db:getMemories', () => {
   `).all();
 });
 
-ipcMain.handle('db:getMessageFullText', (_, uuid) => {
+ipcMain.handle('db:getMessageFullText', async (_, uuid) => {
   if (!db) return null;
   const msg = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
   if (!msg || (msg.visibility ?? 'visible') !== 'visible') return null;
@@ -728,7 +733,7 @@ ipcMain.handle('db:getMessageFullText', (_, uuid) => {
     ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id) ?? null
     : null;
   const paths = getRuntimePaths();
-  const raw = paths.providerRegistry.raw({
+  const lookup = {
     source: msg.source || session?.source || 'claude',
     messageUuid: String(uuid),
     session,
@@ -736,7 +741,18 @@ ipcMain.handle('db:getMessageFullText', (_, uuid) => {
     cursor: storedSessionCursor(db, paths.providerRegistry, session),
     subagent,
     workflowAgent,
-  });
+  };
+  // The ZCode source is SQLite, so open/read it in the existing indexer
+  // worker rather than blocking Electron's main thread on a custom root.
+  if (lookup.source === 'zcode') {
+    try {
+      const messageText = await indexerWorker?.readZcodeMessageText(lookup);
+      return messageText ?? msg.text ?? null;
+    } catch {
+      return msg.text ?? null;
+    }
+  }
+  const raw = paths.providerRegistry.raw(lookup);
   return raw?.messageText ?? msg.text ?? null;
 });
 
