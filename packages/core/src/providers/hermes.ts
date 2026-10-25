@@ -406,14 +406,27 @@ function readSchemaVersion(db: SqliteDb): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-const SESSION_COLUMNS = `id, source, model, title, parent_session_id, started_at, ended_at,
-  end_reason, message_count, tool_call_count, cwd, git_branch, profile_name, archived, hidden`;
+/**
+ * The columns this adapter reads, in one place. `parse()`, the digest pass and the SELECT lists all
+ * derive from these, so a column added to one list cannot go missing from another.
+ */
+const SESSION_COLUMNS = [
+  'id', 'source', 'model', 'title', 'parent_session_id', 'started_at', 'ended_at', 'end_reason',
+  'message_count', 'tool_call_count', 'cwd', 'git_branch', 'profile_name', 'archived', 'hidden',
+] as const;
+
+/** Every column parse() projects from a message row; the digest pass reads exactly these too. */
+const PROJECTED_MESSAGE_COLUMNS = [
+  'id', 'role', 'content', 'tool_calls', 'tool_call_id', 'tool_name', 'timestamp',
+  'reasoning', 'reasoning_content', 'active', 'compacted', 'display_kind',
+  'codex_message_items', '_compressed_summary',
+] as const;
 
 /** Add optional usage columns only where the source schema has them. */
 function sessionColumns(db: SqliteDb): string {
   const present = new Set(db.prepare('PRAGMA table_info(sessions)').all().map(row => String(row['name'])));
   const usage = ['input_tokens', 'output_tokens'].filter(column => present.has(column));
-  return [SESSION_COLUMNS, ...usage].join(', ');
+  return [...SESSION_COLUMNS, ...usage].join(', ');
 }
 
 function readSessionRows(db: SqliteDb): SqliteRow[] {
@@ -534,16 +547,6 @@ function sessionFingerprintOf(
 ): string {
   return sessionFingerprint(row, profile, sessionWatermark(db, row['id']), parent, schemaVersion);
 }
-
-/**
- * Every column parse() projects from a message row. The digest pass reads exactly these
- * columns, so "the digest changed" and "a projected row changed" are the same statement.
- */
-const PROJECTED_MESSAGE_COLUMNS = [
-  'id', 'role', 'content', 'tool_calls', 'tool_call_id', 'tool_name', 'timestamp',
-  'reasoning', 'reasoning_content', 'active', 'compacted', 'display_kind',
-  'codex_message_items', '_compressed_summary',
-] as const;
 
 function digestOfMessages(rows: readonly SqliteRow[]): string {
   const hash = createHash('sha256');
@@ -803,9 +806,7 @@ function hermesParse({ openStore }: HermesParseDeps) {
       // decides the transcript order rather than timestamp.
       const messages = db
         .prepare(
-          `SELECT id, role, content, tool_calls, tool_call_id, tool_name, timestamp,
-                reasoning_content, reasoning, active, compacted, display_kind, codex_message_items,
-                _compressed_summary
+          `SELECT ${PROJECTED_MESSAGE_COLUMNS.join(', ')}
          FROM messages WHERE session_id = ? ORDER BY rowid`,
         )
         .all(meta.rawSessionId);
